@@ -1,15 +1,181 @@
+# Project Path: core/worker.py
 import os
+import shlex
+import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from fractions import Fraction
 
+from PyQt6.QtCore import QThread, pyqtSignal, QMutex, QWaitCondition
 from PyQt6.QtCore import Qt, QSettings, QTimer
+from PyQt6.QtGui import QFontMetrics
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QFileDialog, QProgressBar, QMessageBox, QComboBox,
-    QTableWidgetItem, QHeaderView, QAbstractItemView, QSpinBox
+    QTableWidgetItem, QHeaderView, QAbstractItemView, QSpinBox, QTableWidget, QToolTip
 )
 
-from core.worker import WorkerThread
-from utils.ui_helpers import SmartTooltipTableWidget
+
+def format_duration(seconds):
+    h = int(seconds) // 3600
+    m = (int(seconds) % 3600) // 60
+    s = int(seconds) % 60
+    return f"{h}h{m}m{s}s" if h else f"{m}m{s}s"
+
+
+class SmartTooltipTableWidget(QTableWidget):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setMouseTracking(True)
+        self._last_tooltip_text = ""
+
+    def mouseMoveEvent(self, event):
+        pos = event.position().toPoint()
+        item = self.itemAt(pos)
+        if item:
+            rect = self.visualItemRect(item)
+            fm = QFontMetrics(item.font() if item.font() else self.font())
+            text = item.text()
+            text_width = fm.horizontalAdvance(text)
+            cell_width = rect.width() - 6
+
+            if text_width > cell_width:
+                if self._last_tooltip_text != text:
+                    item.setToolTip(text)
+                    self._last_tooltip_text = text
+            else:
+                if self._last_tooltip_text != "":
+                    item.setToolTip("")
+                    self._last_tooltip_text = ""
+        else:
+            if self._last_tooltip_text != "":
+                self._last_tooltip_text = ""
+                QToolTip.hideText()
+        super().mouseMoveEvent(event)
+
+
+# ========== 后台线程 ==========
+
+class WorkerThread(QThread):
+    progress = pyqtSignal(str, int, int)
+    finished = pyqtSignal(list, str)
+    error = pyqtSignal(str)
+    itemReady = pyqtSignal(dict)
+
+    def __init__(self, folder, mode, param):
+        super().__init__()
+        self.folder = folder
+        self.mode = mode
+        self.param = param
+        self._is_running = True
+        self._is_paused = False
+        self.mutex = QMutex()
+        self.pause_cond = QWaitCondition()
+
+    def run(self):
+        try:
+            collected = []
+            file_list = [os.path.join(dp, f) for dp, dn, filenames in os.walk(self.folder) for f in filenames]
+            video_files = [f for f in file_list if os.path.splitext(f)[1].lower() in ['.mp4', '.avi', '.mov', '.mkv']]
+            total = len(video_files)
+
+            def process_file(path_index):
+                index, path = path_index
+                name = os.path.basename(path)
+                root = os.path.dirname(path)
+                fname, ext = os.path.splitext(name)
+                ext = ext.lower()
+
+                self.mutex.lock()
+                while self._is_paused:
+                    self.pause_cond.wait(self.mutex)
+                self.mutex.unlock()
+
+                if not self._is_running:
+                    return None
+
+                self.progress.emit(name, index + 1, total)
+
+                info = {
+                    "文件名": name,
+                    "所在路径": root,
+                    "类型": ext.lstrip('.'),
+                    "大小(MB)": round(os.path.getsize(path) / (1024 * 1024), 2),
+                    "时长": "",
+                    "每秒帧数": "",
+                    "截取帧数量": ""
+                }
+
+                try:
+                    CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+                    # 获取视频信息
+                    cmd = f'ffprobe -v error -select_streams v:0 -show_entries stream=duration,r_frame_rate -of default=noprint_wrappers=1:nokey=1 "{path}"'
+                    result = subprocess.run(
+                        shlex.split(cmd),
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True, creationflags=CREATE_NO_WINDOW
+                    )
+                    output_lines = result.stdout.decode().splitlines()
+                    if len(output_lines) < 2:
+                        raise ValueError(f"ffprobe 输出异常：{output_lines}")
+
+                    frame_rate_expr = output_lines[0]
+                    duration = float(output_lines[1])
+
+                    try:
+                        print(f"[DEBUG] 解析前帧率字符串: {repr(frame_rate_expr)}")
+                        fps = float(Fraction(frame_rate_expr.strip()))
+                        print(f"[DEBUG] fps 计算结果: {fps}")
+                    except Exception as e:
+                        raise ValueError(f"无法解析帧率 '{frame_rate_expr.strip()}': {str(e)}")
+
+                    info["时长"] = format_duration(duration)
+                    info["每秒帧数"] = round(fps, 2)
+
+                    if self.mode == 0:
+                        frame_count = int(duration / self.param)
+                    else:
+                        total_frames = int(duration * fps)
+                        frame_count = total_frames // self.param
+
+                    info["截取帧数量"] = frame_count
+
+                except subprocess.CalledProcessError as e:
+                    print(f"[ffprobe error] {path}: {e.output.decode()}")
+                    info["时长"] = "读取失败"
+
+                except Exception as e:
+                    print(f"[exception] {path}: {str(e)}")
+                    info["时长"] = "读取失败"
+
+                return info
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = {executor.submit(process_file, (i, path)): path for i, path in enumerate(video_files)}
+                for future in as_completed(futures):
+                    info = future.result()
+                    if info:
+                        collected.append(info)
+                        self.itemReady.emit(info)
+
+            self.finished.emit(collected, self.folder)
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def stop(self):
+        self._is_running = False
+        self.resume()
+
+    def pause(self):
+        self.mutex.lock()
+        self._is_paused = True
+        self.mutex.unlock()
+
+    def resume(self):
+        self.mutex.lock()
+        self._is_paused = False
+        self.mutex.unlock()
+        self.pause_cond.wakeAll()
 
 
 # ========== 主应用 ==========
@@ -116,8 +282,9 @@ class FileCollectorApp(QWidget):
         progress_text_layout.addWidget(self.progress_label)
         layout.addLayout(progress_text_layout)
 
-        self.table = SmartTooltipTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["文件名", "保存路径"])
+        headers = ["文件名", "所在路径", "类型", "大小(MB)", "时长", "每秒帧数", "截取帧数量"]
+        self.table = SmartTooltipTableWidget(0, len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setSectionsClickable(True)
@@ -246,7 +413,12 @@ class FileCollectorApp(QWidget):
         row = self.table.rowCount()
         self.table.insertRow(row)
         self.table.setItem(row, 0, QTableWidgetItem(item["文件名"]))
-        self.table.setItem(row, 1, QTableWidgetItem(item["保存路径"]))
+        self.table.setItem(row, 1, QTableWidgetItem(item["所在路径"]))
+        self.table.setItem(row, 2, QTableWidgetItem(item["类型"]))
+        self.table.setItem(row, 3, QTableWidgetItem(str(item["大小(MB)"])))
+        self.table.setItem(row, 4, QTableWidgetItem(item["时长"]))
+        self.table.setItem(row, 5, QTableWidgetItem(str(item["每秒帧数"])))
+        self.table.setItem(row, 6, QTableWidgetItem(str(item["截取帧数量"])))
         self.auto_resize_columns()
 
     def update_progress(self, filename, index, total):
