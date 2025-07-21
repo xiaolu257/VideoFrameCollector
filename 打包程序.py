@@ -1,43 +1,33 @@
+# Project Path: 打包程序.py
 import os
 import shutil
-import subprocess
+
+import PyInstaller.__main__
 
 
-def remove_path(path):
-    if os.path.isdir(path):
-        print(f"删除文件夹: {path}")
-        shutil.rmtree(path)
-    elif os.path.isfile(path):
-        print(f"删除文件: {path}")
-        os.remove(path)
+def main():
+    base_dir = os.path.abspath(".")
+    resource_path = os.path.join(base_dir, "resources")
+    PyInstaller.__main__.run([
+        'main.py',
+        '--name=MediaInfoCollector',
+        '--windowed',
+        f'--add-data={resource_path}{os.pathsep}resources'
 
+    ])
 
-def run_pyinstaller():
-    # 删除旧的 dist、build、spec 文件
-    remove_path("dist")
-    remove_path("build")
-    remove_path("frame_collector.spec")
+    # 删除 spec 文件
+    spec_file = "MediaInfoCollector.spec"
+    if os.path.exists(spec_file):
+        os.remove(spec_file)
+        print(f"已删除：{spec_file}")
 
-    # 构造打包命令
-    cmd = [
-        "pyinstaller",
-        "--clean",
-        "--windowed",
-        "--name", "frame_collector",
-        "main.py"
-    ]
-    print("开始打包...")
-    subprocess.run(cmd, check=True)
-    print("打包完成。")
-
-    # 再次清理打包中临时生成的文件
-    remove_path("build")
-    remove_path("frame_collector.spec")
+    # 删除 build 目录及其所有内容
+    build_dir = "build"
+    if os.path.exists(build_dir):
+        shutil.rmtree(build_dir)
+        print(f"已删除目录：{build_dir}/")
 
 
 if __name__ == "__main__":
-    try:
-        run_pyinstaller()
-        print("全部完成！")
-    except subprocess.CalledProcessError as e:
-        print("打包过程出现错误:", e)
+    main()
