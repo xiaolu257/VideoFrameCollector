@@ -1,8 +1,9 @@
-# Project Path: core/worker.py
+import datetime
 import os
 import shlex
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fractions import Fraction
 
@@ -56,11 +57,14 @@ class SmartTooltipTableWidget(QTableWidget):
 
 # ========== 后台线程 ==========
 
+
 class WorkerThread(QThread):
     progress = pyqtSignal(str, int, int)
     finished = pyqtSignal(list, str)
     error = pyqtSignal(str)
     itemReady = pyqtSignal(dict)
+    frameExtracted = pyqtSignal(str, int)  # 视频名，已截帧数（可用于UI显示）
+    processing = pyqtSignal(str)
 
     def __init__(self, folder, mode, param):
         super().__init__()
@@ -71,6 +75,15 @@ class WorkerThread(QThread):
         self._is_paused = False
         self.mutex = QMutex()
         self.pause_cond = QWaitCondition()
+        self.output_root = os.path.join(
+            self.folder, "帧生成_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
+        if not os.path.exists(self.output_root):
+            os.makedirs(self.output_root)
+
+        # 新增线程安全计数器
+        self.completed_count = 0
+        self.completed_lock = threading.Lock()
 
     def run(self):
         try:
@@ -94,7 +107,7 @@ class WorkerThread(QThread):
                 if not self._is_running:
                     return None
 
-                self.progress.emit(name, index + 1, total)
+                self.processing.emit(name)
 
                 info = {
                     "文件名": name,
@@ -122,15 +135,14 @@ class WorkerThread(QThread):
                     duration = float(output_lines[1])
 
                     try:
-                        print(f"[DEBUG] 解析前帧率字符串: {repr(frame_rate_expr)}")
                         fps = float(Fraction(frame_rate_expr.strip()))
-                        print(f"[DEBUG] fps 计算结果: {fps}")
                     except Exception as e:
                         raise ValueError(f"无法解析帧率 '{frame_rate_expr.strip()}': {str(e)}")
 
                     info["时长"] = format_duration(duration)
                     info["每秒帧数"] = round(fps, 2)
 
+                    # 计算截取帧数量
                     if self.mode == 0:
                         frame_count = int(duration / self.param)
                     else:
@@ -139,14 +151,42 @@ class WorkerThread(QThread):
 
                     info["截取帧数量"] = frame_count
 
+                    # 创建当前视频帧输出目录
+                    output_dir = os.path.join(self.output_root, fname)
+                    if not os.path.exists(output_dir):
+                        os.makedirs(output_dir)
+
+                    # 构造ffmpeg命令截取帧
+                    if self.mode == 0:
+                        vf_filter = f"select='not(mod(t\\,{self.param}))',setpts=N/FRAME_RATE/TB"
+                    else:
+                        vf_filter = f"select='not(mod(n\\,{self.param}))',setpts=N/FRAME_RATE/TB"
+
+                    output_pattern = os.path.join(output_dir, "frame_%04d.png")
+
+                    ffmpeg_cmd = f'ffmpeg -hide_banner -loglevel error -i "{path}" -vf "{vf_filter}" -vsync vfr "{output_pattern}"'
+
+                    subprocess.run(
+                        shlex.split(ffmpeg_cmd),
+                        check=True, creationflags=CREATE_NO_WINDOW
+                    )
+
+                    self.frameExtracted.emit(name, frame_count)
+
                 except subprocess.CalledProcessError as e:
-                    print(f"[ffprobe error] {path}: {e.output.decode()}")
+                    print(f"[ffmpeg error] {path}: {e}")
                     info["时长"] = "读取失败"
 
                 except Exception as e:
                     print(f"[exception] {path}: {str(e)}")
                     info["时长"] = "读取失败"
 
+                # 进度计数递增
+                with self.completed_lock:
+                    self.completed_count += 1
+                    done = self.completed_count
+
+                self.progress.emit(name, done, total)
                 return info
 
             with ThreadPoolExecutor(max_workers=4) as executor:
@@ -162,10 +202,6 @@ class WorkerThread(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
-    def stop(self):
-        self._is_running = False
-        self.resume()
-
     def pause(self):
         self.mutex.lock()
         self._is_paused = True
@@ -174,11 +210,12 @@ class WorkerThread(QThread):
     def resume(self):
         self.mutex.lock()
         self._is_paused = False
-        self.mutex.unlock()
         self.pause_cond.wakeAll()
+        self.mutex.unlock()
 
 
 # ========== 主应用 ==========
+
 class FileCollectorApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -310,6 +347,9 @@ class FileCollectorApp(QWidget):
         self.table.cellDoubleClicked.connect(self.open_file_from_table)
         QTimer.singleShot(0, self.auto_resize_columns)
 
+    def show_current_processing(self, filename):
+        self.progress_label.setText(f"正在处理：{filename}")  # <<< 新增
+
     def resize_column_to_contents(self, logical_index):
         self.table.resizeColumnToContents(logical_index)
 
@@ -357,7 +397,8 @@ class FileCollectorApp(QWidget):
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.error.connect(self.show_error)
         self.worker.itemReady.connect(self.append_table_item)
-
+        self.worker.processing.connect(self.show_current_processing)
+        
         self.worker.start()
 
         self.start_btn.setEnabled(False)
@@ -421,9 +462,9 @@ class FileCollectorApp(QWidget):
         self.table.setItem(row, 6, QTableWidgetItem(str(item["截取帧数量"])))
         self.auto_resize_columns()
 
-    def update_progress(self, filename, index, total):
-        self.progress_label.setText(f"处理: {filename} ({index}/{total})")
-        self.progress_bar.setValue(int(index / total * 100))
+    def update_progress(self, filename, done, total):
+        self.progress_label.setText(f"已处理完成：{filename} ({done}/{total})")
+        self.progress_bar.setValue(int(done / total * 100))
 
     def show_error(self, msg):
         QMessageBox.critical(self, "错误", msg)
