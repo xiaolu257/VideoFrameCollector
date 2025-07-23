@@ -452,9 +452,30 @@ class FileCollectorApp(QWidget):
         self.progress_bar.setVisible(False)
         self.progress_label.setText("提取完成")
         self.is_paused = False
-        self.worker = None
         self.folder_input.setEnabled(True)
         self.browse_btn.setEnabled(True)
+
+        output_dir = self.worker.output_root if self.worker else None
+        self.worker = None
+
+        if output_dir and os.path.exists(output_dir):
+            reply = QMessageBox.question(
+                self,
+                "提取完成",
+                f"所有帧图像已保存至:\n{output_dir}\n\n是否打开该文件夹？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                try:
+                    if sys.platform.startswith("win"):
+                        os.startfile(output_dir)
+                    elif sys.platform.startswith("darwin"):
+                        subprocess.run(["open", output_dir])
+                    else:
+                        subprocess.run(["xdg-open", output_dir])
+                except Exception as e:
+                    QMessageBox.warning(self, "打开失败", f"无法打开目录:\n{output_dir}\n\n错误信息:\n{str(e)}")
 
     def append_table_item(self, item):
         row = self.table.rowCount()
