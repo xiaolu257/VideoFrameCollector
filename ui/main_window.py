@@ -234,8 +234,8 @@ class FileCollectorApp(QWidget):
 
         self.settings = QSettings("MyCompany", "VideoFrameExtractor")
         self.worker = None
-
         self.is_paused = False
+        self.total_count = 0  # 用于记录所有待处理视频数
 
         self.setup_ui()
 
@@ -348,7 +348,10 @@ class FileCollectorApp(QWidget):
         QTimer.singleShot(0, self.auto_resize_columns)
 
     def show_current_processing(self, filename):
-        self.progress_label.setText(f"正在处理：{filename}")  # <<< 新增
+        if self.worker:
+            done = self.worker.completed_count
+            total = self.total_count if self.total_count > 0 else done
+            self.progress_label.setText(f"正在处理：{filename}（已完成 {done}/{total}）")
 
     def resize_column_to_contents(self, logical_index):
         self.table.resizeColumnToContents(logical_index)
@@ -383,6 +386,11 @@ class FileCollectorApp(QWidget):
             QMessageBox.critical(self, "错误", "请选择有效的文件夹")
             return
 
+        # 预先统计视频文件总数，确保显示总任务正确
+        file_list = [os.path.join(dp, f) for dp, dn, filenames in os.walk(folder) for f in filenames]
+        video_files = [f for f in file_list if os.path.splitext(f)[1].lower() in ['.mp4', '.avi', '.mov', '.mkv']]
+        self.total_count = len(video_files)
+
         self.folder_input.setEnabled(False)
         self.browse_btn.setEnabled(False)
         self.table.setRowCount(0)
@@ -398,7 +406,7 @@ class FileCollectorApp(QWidget):
         self.worker.error.connect(self.show_error)
         self.worker.itemReady.connect(self.append_table_item)
         self.worker.processing.connect(self.show_current_processing)
-        
+
         self.worker.start()
 
         self.start_btn.setEnabled(False)
@@ -463,7 +471,6 @@ class FileCollectorApp(QWidget):
         self.auto_resize_columns()
 
     def update_progress(self, filename, done, total):
-        self.progress_label.setText(f"已处理完成：{filename} ({done}/{total})")
         self.progress_bar.setValue(int(done / total * 100))
 
     def show_error(self, msg):
