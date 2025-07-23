@@ -63,7 +63,7 @@ class WorkerThread(QThread):
     finished = pyqtSignal(list, str)
     error = pyqtSignal(str)
     itemReady = pyqtSignal(dict)
-    frameExtracted = pyqtSignal(str, int)  # 视频名，已截帧数（可用于UI显示）
+    frameExtracted = pyqtSignal(str, int)
     processing = pyqtSignal(str)
 
     def __init__(self, folder, mode, param):
@@ -78,12 +78,19 @@ class WorkerThread(QThread):
         self.output_root = os.path.join(
             self.folder, "帧生成_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         )
-        if not os.path.exists(self.output_root):
-            os.makedirs(self.output_root)
+        os.makedirs(self.output_root, exist_ok=True)
 
-        # 新增线程安全计数器
         self.completed_count = 0
         self.completed_lock = threading.Lock()
+
+    def check_pause_and_stop(self):
+        self.mutex.lock()
+        while self._is_paused and self._is_running:
+            self.pause_cond.wait(self.mutex)
+        running = self._is_running
+        self.mutex.unlock()
+        if not running:
+            raise RuntimeError("中止处理")
 
     def run(self):
         try:
@@ -99,34 +106,26 @@ class WorkerThread(QThread):
                 fname, ext = os.path.splitext(name)
                 ext = ext.lower()
 
-                self.mutex.lock()
-                while self._is_paused:
-                    self.pause_cond.wait(self.mutex)
-                self.mutex.unlock()
-
-                if not self._is_running:
-                    return None
-
-                self.processing.emit(name)
-
-                info = {
-                    "文件名": name,
-                    "所在路径": root,
-                    "类型": ext.lstrip('.'),
-                    "大小(MB)": round(os.path.getsize(path) / (1024 * 1024), 2),
-                    "时长": "",
-                    "每秒帧数": "",
-                    "截取帧数量": ""
-                }
-
                 try:
+                    self.check_pause_and_stop()
+                    self.processing.emit(name)
+
+                    info = {
+                        "文件名": name,
+                        "所在路径": root,
+                        "类型": ext.lstrip('.'),
+                        "大小(MB)": round(os.path.getsize(path) / (1024 * 1024), 2),
+                        "时长": "",
+                        "每秒帧数": "",
+                        "截取帧数量": ""
+                    }
+
                     CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
-                    # 获取视频信息
                     cmd = f'ffprobe -v error -select_streams v:0 -show_entries stream=duration,r_frame_rate -of default=noprint_wrappers=1:nokey=1 "{path}"'
-                    result = subprocess.run(
-                        shlex.split(cmd),
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True, creationflags=CREATE_NO_WINDOW
-                    )
+                    result = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT, check=True, creationflags=CREATE_NO_WINDOW)
+                    self.check_pause_and_stop()
+
                     output_lines = result.stdout.decode().splitlines()
                     if len(output_lines) < 2:
                         raise ValueError(f"ffprobe 输出异常：{output_lines}")
@@ -142,7 +141,6 @@ class WorkerThread(QThread):
                     info["时长"] = format_duration(duration)
                     info["每秒帧数"] = round(fps, 2)
 
-                    # 计算截取帧数量
                     if self.mode == 0:
                         frame_count = int(duration / self.param)
                     else:
@@ -151,37 +149,27 @@ class WorkerThread(QThread):
 
                     info["截取帧数量"] = frame_count
 
-                    # 创建当前视频帧输出目录
                     output_dir = os.path.join(self.output_root, fname)
-                    if not os.path.exists(output_dir):
-                        os.makedirs(output_dir)
+                    os.makedirs(output_dir, exist_ok=True)
 
-                    # 构造ffmpeg命令截取帧
                     if self.mode == 0:
                         vf_filter = f"select='not(mod(t\\,{self.param}))',setpts=N/FRAME_RATE/TB"
                     else:
                         vf_filter = f"select='not(mod(n\\,{self.param}))',setpts=N/FRAME_RATE/TB"
 
                     output_pattern = os.path.join(output_dir, "frame_%04d.png")
-
                     ffmpeg_cmd = f'ffmpeg -hide_banner -loglevel error -i "{path}" -vf "{vf_filter}" -vsync vfr "{output_pattern}"'
-
-                    subprocess.run(
-                        shlex.split(ffmpeg_cmd),
-                        check=True, creationflags=CREATE_NO_WINDOW
-                    )
+                    subprocess.run(shlex.split(ffmpeg_cmd), check=True, creationflags=CREATE_NO_WINDOW)
 
                     self.frameExtracted.emit(name, frame_count)
 
-                except subprocess.CalledProcessError as e:
-                    print(f"[ffmpeg error] {path}: {e}")
-                    info["时长"] = "读取失败"
-
+                except (subprocess.CalledProcessError, RuntimeError) as e:
+                    print(f"[停止或错误] {path}: {e}")
+                    return None
                 except Exception as e:
-                    print(f"[exception] {path}: {str(e)}")
+                    print(f"[异常] {path}: {str(e)}")
                     info["时长"] = "读取失败"
 
-                # 进度计数递增
                 with self.completed_lock:
                     self.completed_count += 1
                     done = self.completed_count
@@ -192,6 +180,8 @@ class WorkerThread(QThread):
             with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = {executor.submit(process_file, (i, path)): path for i, path in enumerate(video_files)}
                 for future in as_completed(futures):
+                    if not self._is_running:
+                        break  # 主线程中断：不等余下任务
                     info = future.result()
                     if info:
                         collected.append(info)
@@ -212,6 +202,10 @@ class WorkerThread(QThread):
         self._is_paused = False
         self.pause_cond.wakeAll()
         self.mutex.unlock()
+
+    def stop(self):
+        self._is_running = False
+        self.resume()  # 唤醒挂起线程，以便它能检测停止状态退出
 
 
 # ========== 主应用 ==========
@@ -357,21 +351,25 @@ class FileCollectorApp(QWidget):
         self.table.resizeColumnToContents(logical_index)
 
     def open_file_from_table(self, row):
-        path_item = self.table.item(row, 1)
-        if path_item:
-            full_path = path_item.text()
-            if os.path.exists(full_path):
-                try:
-                    if sys.platform.startswith("win"):
-                        os.startfile(full_path)
-                    elif sys.platform.startswith("darwin"):
-                        os.system(f'open "{full_path}"')
-                    else:
-                        os.system(f'xdg-open "{full_path}"')
-                except Exception as e:
-                    QMessageBox.warning(self, "打开失败", f"无法打开文件:\n{full_path}\n\n错误信息:\n{str(e)}")
-            else:
-                QMessageBox.warning(self, "文件不存在", f"找不到该文件:\n{full_path}")
+        filename_item = self.table.item(row, 0)
+        if not filename_item or not self.worker:
+            return
+
+        video_name = filename_item.text()
+        output_dir = os.path.join(self.worker.output_root, os.path.splitext(video_name)[0])
+
+        if os.path.exists(output_dir):
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile(output_dir)
+                elif sys.platform.startswith("darwin"):
+                    subprocess.run(["open", output_dir])
+                else:
+                    subprocess.run(["xdg-open", output_dir])
+            except Exception as e:
+                QMessageBox.warning(self, "打开失败", f"无法打开目录:\n{output_dir}\n\n错误信息:\n{str(e)}")
+        else:
+            QMessageBox.warning(self, "目录不存在", f"找不到帧图目录:\n{output_dir}")
 
     def choose_folder(self):
         start_dir = self.folder_input.text() or os.path.expanduser("~")
