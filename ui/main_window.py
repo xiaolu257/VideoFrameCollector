@@ -66,12 +66,14 @@ class WorkerThread(QThread):
     frameExtracted = pyqtSignal(str, int)
     processing = pyqtSignal(str)
 
-    def __init__(self, folder, mode, param, max_threads=4):
+    def __init__(self, folder, mode, param, max_threads=4, image_format="png", jpg_quality=None):
         super().__init__()
         self.folder = folder
         self.mode = mode
         self.param = param
         self.max_threads = max_threads  # 存储线程数
+        self.image_format = image_format
+        self.jpg_quality = jpg_quality
         self._is_running = True
         self._is_paused = False
         self.mutex = QMutex()
@@ -158,9 +160,23 @@ class WorkerThread(QThread):
                     else:
                         vf_filter = f"select='not(mod(n\\,{self.param}))',setpts=N/FRAME_RATE/TB"
 
-                    output_pattern = os.path.join(output_dir, "frame_%04d.png")
-                    threads = self.max_threads  # 使用用户指定的线程数
-                    ffmpeg_cmd = f'ffmpeg -hide_banner -loglevel error -threads {threads} -i "{path}" -vf "{vf_filter}" -vsync vfr "{output_pattern}"'
+                    ext = self.image_format.lower()
+                    output_pattern = os.path.join(output_dir, f"frame_%04d.{ext}")
+                    threads = self.max_threads
+
+                    if ext == "jpg":
+                        quality = self.jpg_quality if self.jpg_quality is not None else 85
+                        ffmpeg_cmd = (
+                            f'ffmpeg -hide_banner -loglevel error -threads {threads} '
+                            f'-i "{path}" -vf "{vf_filter}" -vsync vfr '
+                            f'-qscale:v {int((100 - quality) / 5 + 2)} "{output_pattern}"'
+                        )
+                    else:
+                        ffmpeg_cmd = (
+                            f'ffmpeg -hide_banner -loglevel error -threads {threads} '
+                            f'-i "{path}" -vf "{vf_filter}" -vsync vfr "{output_pattern}"'
+                        )
+
                     subprocess.run(shlex.split(ffmpeg_cmd), check=True, creationflags=create_no_window)
 
                     self.frameExtracted.emit(name, frame_count)
@@ -293,6 +309,32 @@ class FileCollectorApp(QWidget):
         thread_layout.addWidget(self.thread_input)
         layout.addLayout(thread_layout)
 
+        # === 新增图片格式设置行 ===
+        format_layout = QHBoxLayout()
+        format_layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        format_label = QLabel("🖼️ 图片格式:")
+        self.format_box = QComboBox()
+        self.format_box.addItems(["PNG", "JPG"])
+        self.format_box.setCurrentIndex(0)
+        self.format_box.setFixedWidth(100)
+        self.format_box.currentIndexChanged.connect(self.toggle_quality_input)
+
+        self.quality_label = QLabel("压缩质量:")
+        self.quality_input = QSpinBox()
+        self.quality_input.setRange(1, 100)
+        self.quality_input.setValue(85)
+        self.quality_input.setFixedWidth(100)
+
+        # 初始状态隐藏压缩质量设置
+        self.quality_label.setVisible(False)
+        self.quality_input.setVisible(False)
+
+        format_layout.addWidget(format_label)
+        format_layout.addWidget(self.format_box)
+        format_layout.addWidget(self.quality_label)
+        format_layout.addWidget(self.quality_input)
+        layout.addLayout(format_layout)
+
         btn_layout = QHBoxLayout()
         btn_layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
 
@@ -358,6 +400,13 @@ class FileCollectorApp(QWidget):
         self.table.cellDoubleClicked.connect(self.open_file_from_table)
         QTimer.singleShot(0, self.auto_resize_columns)
 
+    def toggle_quality_input(self, index):
+        is_jpg = self.format_box.currentText().lower() == "jpg"
+        self.quality_label.setVisible(is_jpg)
+        self.quality_input.setVisible(is_jpg)
+        if is_jpg:
+            self.quality_input.setValue(85)  # 设置默认压缩质量
+
     def show_current_processing(self, filename):
         if self.worker:
             done = self.worker.completed_count
@@ -389,7 +438,15 @@ class FileCollectorApp(QWidget):
         mode = self.mode_box.currentIndex()
         param = self.param_input.value()
         thread_count = int(self.thread_input.currentText())
-        self.worker = WorkerThread(folder, mode, param, max_threads=thread_count)
+        image_format = self.format_box.currentText().lower()  # 'png' or 'jpg'
+        quality = self.quality_input.value() if image_format == 'jpg' else None
+
+        self.worker = WorkerThread(
+            folder, mode, param,
+            max_threads=thread_count,
+            image_format=image_format,
+            jpg_quality=quality
+        )
         self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.error.connect(self.show_error)

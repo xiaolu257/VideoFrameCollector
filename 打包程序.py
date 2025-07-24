@@ -6,14 +6,10 @@ import PyInstaller.__main__
 
 
 def main():
-    base_dir = os.path.abspath(".")
-    resource_path = os.path.join(base_dir, "resources")
     PyInstaller.__main__.run([
         'main.py',
         '--name=MediaInfoCollector',
         '--windowed',
-        f'--add-data={resource_path}{os.pathsep}resources'
-
     ])
 
     # 删除 spec 文件
