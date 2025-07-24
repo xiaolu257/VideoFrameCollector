@@ -158,7 +158,8 @@ class WorkerThread(QThread):
                         vf_filter = f"select='not(mod(n\\,{self.param}))',setpts=N/FRAME_RATE/TB"
 
                     output_pattern = os.path.join(output_dir, "frame_%04d.png")
-                    ffmpeg_cmd = f'ffmpeg -hide_banner -loglevel error -i "{path}" -vf "{vf_filter}" -vsync vfr "{output_pattern}"'
+                    threads = max(1, min(4, os.cpu_count() // 2))
+                    ffmpeg_cmd = f'ffmpeg -hide_banner -loglevel error -threads {threads} -i "{path}" -vf "{vf_filter}" -vsync vfr "{output_pattern}"'
                     subprocess.run(shlex.split(ffmpeg_cmd), check=True, creationflags=CREATE_NO_WINDOW)
 
                     self.frameExtracted.emit(name, frame_count)
@@ -347,6 +348,45 @@ class FileCollectorApp(QWidget):
             total = self.total_count if self.total_count > 0 else done
             self.progress_label.setText(f"正在处理：{filename}（已完成 {done}/{total}）")
 
+    def update_progress(self, filename, done, total):
+        self.progress_bar.setValue(int(done / total * 100))
+        # ✅ 实时更新文本：不仅在当前任务开始时更新，还要在任何任务完成时更新
+        self.progress_label.setText(f"正在处理：{filename}（已完成 {done}/{total}）")
+
+    def start_process(self):
+        folder = self.folder_input.text().strip()
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.critical(self, "错误", "请选择有效的文件夹")
+            return
+
+        file_list = [os.path.join(dp, f) for dp, dn, filenames in os.walk(folder) for f in filenames]
+        video_files = [f for f in file_list if os.path.splitext(f)[1].lower() in ['.mp4', '.avi', '.mov', '.mkv']]
+        self.total_count = len(video_files)
+
+        self.folder_input.setEnabled(False)
+        self.browse_btn.setEnabled(False)
+        self.table.setRowCount(0)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("开始提取...")
+
+        mode = self.mode_box.currentIndex()
+        param = self.param_input.value()
+        self.worker = WorkerThread(folder, mode, param)
+        self.worker.progress.connect(self.update_progress)
+        self.worker.finished.connect(self.on_worker_finished)
+        self.worker.error.connect(self.show_error)
+        self.worker.itemReady.connect(self.append_table_item)
+        self.worker.processing.connect(self.show_current_processing)
+
+        self.worker.start()
+
+        self.start_btn.setEnabled(False)
+        self.pause_resume_btn.setEnabled(True)
+        self.pause_resume_btn.setText("⏸ 暂停")
+        self.stop_btn.setEnabled(True)
+        self.is_paused = False
+
     def resize_column_to_contents(self, logical_index):
         self.table.resizeColumnToContents(logical_index)
 
@@ -377,41 +417,6 @@ class FileCollectorApp(QWidget):
         if folder:
             self.folder_input.setText(folder)
             self.settings.setValue("last_folder", folder)
-
-    def start_process(self):
-        folder = self.folder_input.text().strip()
-        if not folder or not os.path.isdir(folder):
-            QMessageBox.critical(self, "错误", "请选择有效的文件夹")
-            return
-
-        # 预先统计视频文件总数，确保显示总任务正确
-        file_list = [os.path.join(dp, f) for dp, dn, filenames in os.walk(folder) for f in filenames]
-        video_files = [f for f in file_list if os.path.splitext(f)[1].lower() in ['.mp4', '.avi', '.mov', '.mkv']]
-        self.total_count = len(video_files)
-
-        self.folder_input.setEnabled(False)
-        self.browse_btn.setEnabled(False)
-        self.table.setRowCount(0)
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-        self.progress_label.setText("开始提取...")
-
-        mode = self.mode_box.currentIndex()
-        param = self.param_input.value()
-        self.worker = WorkerThread(folder, mode, param)
-        self.worker.progress.connect(self.update_progress)
-        self.worker.finished.connect(self.on_worker_finished)
-        self.worker.error.connect(self.show_error)
-        self.worker.itemReady.connect(self.append_table_item)
-        self.worker.processing.connect(self.show_current_processing)
-
-        self.worker.start()
-
-        self.start_btn.setEnabled(False)
-        self.pause_resume_btn.setEnabled(True)
-        self.pause_resume_btn.setText("⏸ 暂停")
-        self.stop_btn.setEnabled(True)
-        self.is_paused = False
 
     def auto_resize_columns(self):
         column_count = self.table.columnCount()
@@ -488,9 +493,6 @@ class FileCollectorApp(QWidget):
         self.table.setItem(row, 5, QTableWidgetItem(str(item["每秒帧数"])))
         self.table.setItem(row, 6, QTableWidgetItem(str(item["截取帧数量"])))
         self.auto_resize_columns()
-
-    def update_progress(self, filename, done, total):
-        self.progress_bar.setValue(int(done / total * 100))
 
     def show_error(self, msg):
         QMessageBox.critical(self, "错误", msg)
