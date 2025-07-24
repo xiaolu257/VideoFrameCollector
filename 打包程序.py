@@ -8,12 +8,12 @@ import PyInstaller.__main__
 def main():
     PyInstaller.__main__.run([
         'main.py',
-        '--name=MediaInfoCollector',
+        '--name=VideoFrameCollector',
         '--windowed',
     ])
 
     # 删除 spec 文件
-    spec_file = "MediaInfoCollector.spec"
+    spec_file = "VideoFrameCollector.spec"
     if os.path.exists(spec_file):
         os.remove(spec_file)
         print(f"已删除：{spec_file}")
