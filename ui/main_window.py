@@ -66,11 +66,12 @@ class WorkerThread(QThread):
     frameExtracted = pyqtSignal(str, int)
     processing = pyqtSignal(str)
 
-    def __init__(self, folder, mode, param):
+    def __init__(self, folder, mode, param, max_threads=4):
         super().__init__()
         self.folder = folder
         self.mode = mode
         self.param = param
+        self.max_threads = max_threads  # 存储线程数
         self._is_running = True
         self._is_paused = False
         self.mutex = QMutex()
@@ -120,10 +121,10 @@ class WorkerThread(QThread):
                         "截取帧数量": ""
                     }
 
-                    CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+                    create_no_window = 0x08000000 if sys.platform == "win32" else 0
                     cmd = f'ffprobe -v error -select_streams v:0 -show_entries stream=duration,r_frame_rate -of default=noprint_wrappers=1:nokey=1 "{path}"'
                     result = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE,
-                                            stderr=subprocess.STDOUT, check=True, creationflags=CREATE_NO_WINDOW)
+                                            stderr=subprocess.STDOUT, check=True, creationflags=create_no_window)
                     self.check_pause_and_stop()
 
                     output_lines = result.stdout.decode().splitlines()
@@ -158,9 +159,9 @@ class WorkerThread(QThread):
                         vf_filter = f"select='not(mod(n\\,{self.param}))',setpts=N/FRAME_RATE/TB"
 
                     output_pattern = os.path.join(output_dir, "frame_%04d.png")
-                    threads = max(1, min(4, os.cpu_count() // 2))
+                    threads = self.max_threads  # 使用用户指定的线程数
                     ffmpeg_cmd = f'ffmpeg -hide_banner -loglevel error -threads {threads} -i "{path}" -vf "{vf_filter}" -vsync vfr "{output_pattern}"'
-                    subprocess.run(shlex.split(ffmpeg_cmd), check=True, creationflags=CREATE_NO_WINDOW)
+                    subprocess.run(shlex.split(ffmpeg_cmd), check=True, creationflags=create_no_window)
 
                     self.frameExtracted.emit(name, frame_count)
 
@@ -178,7 +179,7 @@ class WorkerThread(QThread):
                 self.progress.emit(name, done, total)
                 return info
 
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
                 futures = {executor.submit(process_file, (i, path)): path for i, path in enumerate(video_files)}
                 for future in as_completed(futures):
                     if not self._is_running:
@@ -214,6 +215,7 @@ class WorkerThread(QThread):
 class FileCollectorApp(QWidget):
     def __init__(self):
         super().__init__()
+        self.thread_input = None
         self.table = None
         self.progress_label = None
         self.progress_bar = None
@@ -276,6 +278,20 @@ class FileCollectorApp(QWidget):
         mode_layout.addWidget(param_label)
         mode_layout.addWidget(self.param_input)
         layout.addLayout(mode_layout)
+
+        # === 新增线程数控制行 ===
+        thread_layout = QHBoxLayout()
+        thread_layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        thread_label = QLabel("⚙️ 最大线程数:")
+        self.thread_input = QComboBox()
+        cpu_threads = os.cpu_count() or 4
+        for i in range(1, cpu_threads + 1):
+            self.thread_input.addItem(str(i))
+        default_threads = min(4, cpu_threads)
+        self.thread_input.setCurrentIndex(default_threads - 1)  # 默认选择第 default_threads 项
+        thread_layout.addWidget(thread_label)
+        thread_layout.addWidget(self.thread_input)
+        layout.addLayout(thread_layout)
 
         btn_layout = QHBoxLayout()
         btn_layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
@@ -372,7 +388,8 @@ class FileCollectorApp(QWidget):
 
         mode = self.mode_box.currentIndex()
         param = self.param_input.value()
-        self.worker = WorkerThread(folder, mode, param)
+        thread_count = int(self.thread_input.currentText())
+        self.worker = WorkerThread(folder, mode, param, max_threads=thread_count)
         self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.error.connect(self.show_error)
