@@ -10,6 +10,9 @@ def main():
         'main.py',
         '--name=VideoFrameCollector',
         '--windowed',
+        '--noconfirm',
+        # ✅ 把 ffmpeg 文件夹打包到 _internal/ffmpeg 目录
+        '--add-data=ffmpeg;ffmpeg'
     ])
 
     # 删除 spec 文件

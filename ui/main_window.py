@@ -38,6 +38,7 @@ class FileCollectorApp(QWidget):
         self.worker = None
         self.is_paused = False
         self.total_count = 0  # 用于记录所有待处理视频数
+        self.last_output_root = None  # 保存最后一次处理的输出根目录
 
         self.setup_ui()
 
@@ -93,7 +94,7 @@ class FileCollectorApp(QWidget):
         for i in range(1, cpu_threads + 1):
             self.thread_input.addItem(str(i))
         default_threads = min(4, cpu_threads)
-        self.thread_input.setCurrentIndex(default_threads - 1)  # 默认选择第 default_threads 项
+        self.thread_input.setCurrentIndex(default_threads - 1)
         thread_layout.addWidget(thread_label)
         thread_layout.addWidget(self.thread_input)
         layout.addLayout(thread_layout)
@@ -114,7 +115,6 @@ class FileCollectorApp(QWidget):
         self.quality_input.setValue(85)
         self.quality_input.setFixedWidth(100)
 
-        # 初始状态隐藏压缩质量设置
         self.quality_label.setVisible(False)
         self.quality_input.setVisible(False)
 
@@ -194,7 +194,7 @@ class FileCollectorApp(QWidget):
         self.quality_label.setVisible(is_jpg)
         self.quality_input.setVisible(is_jpg)
         if is_jpg:
-            self.quality_input.setValue(85)  # 设置默认压缩质量
+            self.quality_input.setValue(85)
 
     def show_current_processing(self, filename):
         if self.worker:
@@ -204,7 +204,6 @@ class FileCollectorApp(QWidget):
 
     def update_progress(self, filename, done, total):
         self.progress_bar.setValue(int(done / total * 100))
-        # ✅ 实时更新文本：不仅在当前任务开始时更新，还要在任何任务完成时更新
         self.progress_label.setText(f"正在处理：{filename}（已完成 {done}/{total}）")
 
     def start_process(self):
@@ -227,7 +226,7 @@ class FileCollectorApp(QWidget):
         mode = self.mode_box.currentIndex()
         param = self.param_input.value()
         thread_count = int(self.thread_input.currentText())
-        image_format = self.format_box.currentText().lower()  # 'png' or 'jpg'
+        image_format = self.format_box.currentText().lower()
         quality = self.quality_input.value() if image_format == 'jpg' else None
 
         self.worker = WorkerThread(
@@ -253,26 +252,29 @@ class FileCollectorApp(QWidget):
     def resize_column_to_contents(self, logical_index):
         self.table.resizeColumnToContents(logical_index)
 
-    def open_file_from_table(self, row):
+    def open_file_from_table(self, row, column):
         filename_item = self.table.item(row, 0)
-        if not filename_item or not self.worker:
+        if not filename_item or not self.last_output_root:
             return
 
-        video_name = filename_item.text()
-        output_dir = os.path.join(self.worker.output_root, os.path.splitext(video_name)[0])
+        video_name = filename_item.text().strip()
+        output_dir = os.path.join(self.last_output_root, os.path.splitext(video_name)[0])
 
-        if os.path.exists(output_dir):
+        self.open_output_folder(output_dir)
+
+    def open_output_folder(self, path):
+        if os.path.exists(path):
             try:
                 if sys.platform.startswith("win"):
-                    os.startfile(output_dir)
+                    os.startfile(path)
                 elif sys.platform.startswith("darwin"):
-                    subprocess.run(["open", output_dir])
+                    subprocess.run(["open", path])
                 else:
-                    subprocess.run(["xdg-open", output_dir])
+                    subprocess.run(["xdg-open", path])
             except Exception as e:
-                QMessageBox.warning(self, "打开失败", f"无法打开目录:\n{output_dir}\n\n错误信息:\n{str(e)}")
+                QMessageBox.warning(self, "打开失败", f"无法打开目录:\n{path}\n\n错误信息:\n{str(e)}")
         else:
-            QMessageBox.warning(self, "目录不存在", f"找不到帧图目录:\n{output_dir}")
+            QMessageBox.warning(self, "目录不存在", f"找不到帧图目录:\n{path}")
 
     def choose_folder(self):
         start_dir = self.folder_input.text() or os.path.expanduser("~")
@@ -323,27 +325,20 @@ class FileCollectorApp(QWidget):
         self.folder_input.setEnabled(True)
         self.browse_btn.setEnabled(True)
 
-        output_dir = self.worker.output_root if self.worker else None
+        # 保存输出根目录，保证任务完成后仍可打开
+        self.last_output_root = self.worker.output_root if self.worker else None
         self.worker = None
 
-        if output_dir and os.path.exists(output_dir):
+        if self.last_output_root and os.path.exists(self.last_output_root):
             reply = QMessageBox.question(
                 self,
                 "提取完成",
-                f"所有帧图像已保存至:\n{output_dir}\n\n是否打开该文件夹？",
+                f"所有帧图像已保存至:\n{self.last_output_root}\n\n是否打开该文件夹？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes
             )
             if reply == QMessageBox.StandardButton.Yes:
-                try:
-                    if sys.platform.startswith("win"):
-                        os.startfile(output_dir)
-                    elif sys.platform.startswith("darwin"):
-                        subprocess.run(["open", output_dir])
-                    else:
-                        subprocess.run(["xdg-open", output_dir])
-                except Exception as e:
-                    QMessageBox.warning(self, "打开失败", f"无法打开目录:\n{output_dir}\n\n错误信息:\n{str(e)}")
+                self.open_output_folder(self.last_output_root)
 
     def append_table_item(self, item):
         row = self.table.rowCount()
