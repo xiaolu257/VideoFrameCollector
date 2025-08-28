@@ -196,15 +196,9 @@ class FileCollectorApp(QWidget):
         if is_jpg:
             self.quality_input.setValue(85)
 
-    def show_current_processing(self, filename):
-        if self.worker:
-            done = self.worker.completed_count
-            total = self.total_count if self.total_count > 0 else done
-            self.progress_label.setText(f"正在处理：{filename}（已完成 {done}/{total}）")
-
     def update_progress(self, filename, done, total):
         self.progress_bar.setValue(int(done / total * 100))
-        self.progress_label.setText(f"正在处理：{filename}（已完成 {done}/{total}）")
+        self.progress_label.setText(f"已完成：{filename}（进度：{done}/{total}）")
 
     def start_process(self):
         folder = self.folder_input.text().strip()
@@ -239,8 +233,8 @@ class FileCollectorApp(QWidget):
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.error.connect(self.show_error)
         self.worker.itemReady.connect(self.append_table_item)
-        self.worker.processing.connect(self.show_current_processing)
 
+        self.worker.modeNotice.connect(lambda text: QMessageBox.information(self, "处理模式", text))
         self.worker.start()
 
         self.start_btn.setEnabled(False)

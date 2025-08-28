@@ -24,7 +24,7 @@
 
 1. 克隆仓库
    ```bash
-   git clone https://github.com/yourname/VideoFrameCollector.git
+   git clone https://github.com/xiaolu257/VideoFrameCollector.git
    cd VideoFrameCollector
    ```
 
